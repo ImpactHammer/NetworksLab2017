@@ -64,12 +64,20 @@ int main(int argc, char *argv[]) {
     printf("Here is the message: %s\n", buffer);
 
     /* Write a response to the client */
-    n = write(newsockfd, "I got your message", 18); // send on Windows
+    // n = write(newsockfd, "I got your message", 18); // send on Windows
+    n = write(newsockfd, "I got , ", 6);
+    usleep(1);
+    n = write(newsockfd, "your message!", 13);
+
 
     if (n < 0) {
         perror("ERROR writing to socket");
         exit(1);
     }
+
+    /* Closing socket */
+    shutdown(sockfd, SHUT_RDWR);
+    close(sockfd);
 
     return 0;
 }

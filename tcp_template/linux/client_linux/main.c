@@ -7,6 +7,21 @@
 
 #include <string.h>
 
+int readn(int s, char* buf, int b_remain) {
+    int b_rcvd = 0;
+    int rc;
+    while(b_remain) {
+        rc = read(s, buf + b_rcvd, b_remain);
+        if (rc < 1) {
+            return rc;
+        }
+        b_rcvd += rc;
+        b_remain -= rc;
+    }
+    
+    return b_rcvd;
+}
+
 int main(int argc, char *argv[]) {
     int sockfd, n;
     uint16_t portno;
@@ -66,12 +81,16 @@ int main(int argc, char *argv[]) {
 
     /* Now read server response */
     bzero(buffer, 256);
-    n = read(sockfd, buffer, 255);
+    n = readn(sockfd, buffer, 19);
 
     if (n < 0) {
         perror("ERROR reading from socket");
         exit(1);
     }
+
+    /* Closing socket */
+    shutdown(sockfd, SHUT_RDWR);
+    close(sockfd);
 
     printf("%s\n", buffer);
     return 0;
