@@ -69,10 +69,7 @@ int main(int argc, char *argv[]) {
     printf("Here is the message: %s\n", buffer);
 
     /* Write a response to the client */
-    // n = send(newsockfd, "I got your message", 18, 0); // send on Windows
-    n = send(newsockfd, "I got , ", 6, 0);
-    Sleep(1);
-    n = send(newsockfd, "your message!", 13, 0);
+    n = send(newsockfd, "I got your message", 18, 0); // send on Windows
 
     if (n < 0) {
         perror("ERROR writing to socket");
