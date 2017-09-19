@@ -88,7 +88,7 @@ int main(int argc, char *argv[]) {
     /* Now read server response */
     memset(buffer, 0, 256);
     // n = recv(sockfd, buffer, 255, 0);
-    n = readn(sockfd, buffer, 19, 0);
+    n = readn(sockfd, buffer, 18, 0);
 
     if (n < 0) {
         perror("ERROR reading from socket");

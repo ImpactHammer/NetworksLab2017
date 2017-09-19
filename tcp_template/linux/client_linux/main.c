@@ -81,7 +81,7 @@ int main(int argc, char *argv[]) {
 
     /* Now read server response */
     bzero(buffer, 256);
-    n = readn(sockfd, buffer, 19);
+    n = readn(sockfd, buffer, 18);
 
     if (n < 0) {
         perror("ERROR reading from socket");
