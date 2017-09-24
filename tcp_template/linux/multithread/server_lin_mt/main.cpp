@@ -12,7 +12,7 @@
 
 struct sockets {
     int listener;
-    std::set<int> acceptors;
+    std::set<int> accepted;
 };
 
 void* serve(void* arg) {
@@ -63,7 +63,7 @@ void* monitor (void* arg) {
             exit(1);
         }
 
-        sockets->acceptors.insert(newsockfd);
+        sockets->accepted.insert(newsockfd);
         pthread_create(&thread, NULL, &serve, (void*)&newsockfd);
     }
 }
@@ -128,7 +128,7 @@ int main(int argc, char *argv[]) {
     pthread_detach(thread_monitor);
 
     std::set<int>::iterator it;
-    for (it = sockets.acceptors.begin(); it != sockets.acceptors.end(); it++) {
+    for (it = sockets.accepted.begin(); it != sockets.accepted.end(); it++) {
         shutdown(*it, SHUT_RDWR);
         close(*it);
     }
