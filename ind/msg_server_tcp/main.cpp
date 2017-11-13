@@ -13,14 +13,34 @@
 
 #include <pthread.h>
 
-#define HEADER_LENGTH 8
-#define OPT_LENGTH 4        // probably will vary
-#define IP_LENGTH 4
-#define MSG_LENGTH 256      // maybe would be variable
+#define HEADER_LEN      8   // length of [header]
+#define OPT_UNAME_LEN   16  // length of {username} in [options]
+#define OPT_MSGLEN_LEN  2   // length of {message length} in [options]
+#define MSG_MAXLEN      256 // maximum length of [message]
 
-std::map<std::string, void*(*)(void*)> handlers;  // key: msg header; value: handler
-std::map<in_addr_t, int> ip_sock;
-std::map<int, pthread_t*> sock_thread;
+#define CMD_SEND_MESSAGE        "msg"
+#define CMD_BROADCAST_MESSAGE   "bcmsg"
+#define CMD_DISCONNECT_CLIENT   "disc"
+#define CMD_EXIT                "exit"
+
+#define HDR_CLI_AUTHORIZE           "auth_me"
+#define HDR_CLI_RETRANSMIT_MESSAGE  "ret_msg"
+#define HDR_CLI_DISCONNECT          "disc_me"
+
+#define HDR_SRV_INCOMING_MESSAGE    "inc_msg"
+
+#define USERNAME_SERVER     "@SERVER"
+#define USERNAME_UNKNOWN    "@UNKNOWN"
+
+#define RC_CLIENT_DISCONNECTED  2
+#define RC_SERVER_CLOSING       1
+
+typedef std::pair<std::string, void*(*)(void*)> fname_function;
+
+std::map<std::string, void*(*)(void*)> handlers;    // key: msg header; value: handler
+std::map<std::string, int> uname_sock;              // key: username  ; value: socket
+std::map<int, std::string> sock_uname;              // key: socket    ; value: username
+std::map<int, pthread_t*> sock_thread;              // key: socket    ; value: thread
 
 struct sockets {
     int listener;
@@ -31,12 +51,13 @@ struct sockets sockets;
 
 struct sockaddr_in serv_addr;
 
+
 int readn(int s, char* buf, int b_remain) {
     int b_rcvd = 0;
     int rc;
     while(b_remain) {
         rc = read(s, buf + b_rcvd, b_remain);
-        if (rc < 0) {
+        if (rc <= 0) {
             return rc;
         }
         b_rcvd += rc;
@@ -46,77 +67,213 @@ int readn(int s, char* buf, int b_remain) {
     return b_rcvd;
 }
 
-void* ret_msg(void* arg) {
 
-    int sock_cli_sender = *((int*)arg);
-    int sock_cli_recver;
-    ssize_t rc;
-    char buffer_opt[OPT_LENGTH];
-    char buffer_msg[MSG_LENGTH];
-    bzero(buffer_opt, OPT_LENGTH);
-    bzero(buffer_msg, MSG_LENGTH);
+void send_msg_by_sock(int socket, char* header, char* uname, char* msg) {
 
-    rc = readn(sock_cli_sender, buffer_opt, OPT_LENGTH);
+    char buffer_head[HEADER_LEN];
+    char buffer_opt[OPT_UNAME_LEN + OPT_MSGLEN_LEN];
+    char buffer_msg[MSG_MAXLEN];
 
-    in_addr_t ip = *((in_addr_t*)buffer_opt);
+    bzero(buffer_head, HEADER_LEN);
+    bzero(buffer_opt, OPT_UNAME_LEN + OPT_MSGLEN_LEN);
+    bzero(buffer_msg, MSG_MAXLEN);
 
-    sock_cli_recver = ip_sock[ip];
-    if (sock_cli_recver == NULL) {
+    bcopy(header, buffer_head, HEADER_LEN);
 
-        std::cout << "unknown ip" << std::endl;                 // tbd
-        return NULL;
+    short int msg_len;
+    int opt_len;
+    if (msg != NULL) {
+        msg_len = strlen(msg);
+        opt_len = OPT_UNAME_LEN + OPT_MSGLEN_LEN;
+    } else {
+        msg_len = 0;
+        opt_len = OPT_UNAME_LEN;
     }
 
-    rc = readn(sock_cli_sender, buffer_msg, MSG_LENGTH);
+    if (uname != NULL) {
+        bcopy(uname, buffer_opt, OPT_UNAME_LEN);
+    }
 
-    char buffer_head[HEADER_LENGTH] = "inc_msg";
-    rc = write(sock_cli_recver, buffer_head, HEADER_LENGTH);
-    rc = write(sock_cli_recver, buffer_opt, OPT_LENGTH);
-    rc = write(sock_cli_recver, buffer_msg, MSG_LENGTH);
+    if (msg_len != 0) {
+        bcopy(&msg_len, buffer_opt + OPT_UNAME_LEN, OPT_MSGLEN_LEN);
+        bcopy(msg, buffer_msg, msg_len);
+    }
 
-    if (rc < 0) {
-        perror("ERROR writing to socket");
-        exit(1);
+    write(socket, buffer_head, HEADER_LEN);
+    write(socket, buffer_opt, opt_len);
+    if (msg_len != 0) {
+        write(socket, buffer_msg, msg_len);
+    }
+}
+
+
+void recv_msg_by_sock(int socket, char* buffer_opt, char* buffer_msg) {
+
+    bzero(buffer_opt, OPT_UNAME_LEN + OPT_MSGLEN_LEN);
+    if (buffer_msg != NULL) {
+        bzero(buffer_msg, MSG_MAXLEN);
+    }
+
+    int opt_len;
+    if (buffer_msg != NULL) {
+        opt_len = OPT_UNAME_LEN + OPT_MSGLEN_LEN;
+    } else {
+        opt_len = OPT_UNAME_LEN;
+    }
+
+    readn(socket, buffer_opt, opt_len);
+
+    short int msg_len;
+    bcopy(buffer_opt + OPT_UNAME_LEN, &msg_len, OPT_MSGLEN_LEN);
+
+    if (msg_len != 0) {
+        readn(socket, buffer_msg, msg_len);
+    }
+}
+
+
+void* send_msg(void* arg) {     // msg to 1 client
+
+    char input_name[OPT_UNAME_LEN];
+    char input_msg[MSG_MAXLEN];
+    memset(input_name, 0, OPT_UNAME_LEN);
+    memset(input_msg, 0, MSG_MAXLEN);
+    std::cin.getline(input_name, OPT_UNAME_LEN, ' ');
+    std::cin.getline(input_msg, MSG_MAXLEN);
+    std::cin.clear();
+
+    if (uname_sock.find(std::string(input_name)) != uname_sock.end()) {
+        int sockfd = uname_sock[std::string(input_name)];
+        send_msg_by_sock(sockfd, HDR_SRV_INCOMING_MESSAGE, USERNAME_SERVER, input_msg);
+    } else {
+        std::cout << "user is offline\n";
     }
 
     return NULL;
 }
 
+
+void* send_msg_bc(void* arg) {  // msg to all clients
+
+    char input_msg[MSG_MAXLEN];
+    memset(input_msg, 0, MSG_MAXLEN);
+    std::cin.getline(input_msg, MSG_MAXLEN);
+    std::cin.clear();
+
+    for (std::set<int>::iterator it = sockets.accepted.begin();
+         it != sockets.accepted.end(); it++) {
+
+        int sockfd = *it;
+
+        char header[HEADER_LEN] = HDR_SRV_INCOMING_MESSAGE;
+        char uname[] = USERNAME_SERVER;
+
+        send_msg_by_sock(sockfd, header, uname, input_msg);
+    }
+
+    return NULL;
+}
+
+
+void* auth_client(void* arg) {
+
+    ssize_t rc;
+    int sockfd = *((int*)arg);
+    char uname[OPT_UNAME_LEN];
+
+    recv_msg_by_sock(sockfd, uname, NULL);
+
+    std::cout << "user " << uname << " is online\n";
+
+    if (sock_uname.find(sockfd) != sock_uname.end()) {
+        uname_sock.erase(sock_uname[sockfd]);
+        sock_uname.erase(sockfd);
+    }
+    if (uname_sock.find(std::string(uname)) != uname_sock.end()) {
+        sock_uname.erase(uname_sock[std::string(uname)]);
+        uname_sock.erase(std::string(uname));
+    }
+
+    uname_sock.insert(std::pair<std::string, int>(std::string(uname), sockfd));
+    sock_uname.insert(std::pair<int, std::string>(sockfd, std::string(uname)));
+
+    return NULL;
+}
+
+
+void* ret_msg(void* arg) {
+
+    int rc;
+    int sock_cli_sender = *((int*)arg);
+    int sock_cli_recver;
+    char buffer_opt[OPT_UNAME_LEN + OPT_MSGLEN_LEN];
+    char buffer_msg[MSG_MAXLEN];
+
+    recv_msg_by_sock(sock_cli_sender, buffer_opt, buffer_msg);
+
+    char uname[OPT_UNAME_LEN];
+    bzero(uname, OPT_UNAME_LEN);
+    bcopy(buffer_opt, uname, OPT_UNAME_LEN); // get username from [options]
+
+    if (uname_sock.find(std::string(uname)) != uname_sock.end()) {
+        sock_cli_recver = uname_sock[std::string(uname)];
+
+    } else {
+        send_msg_by_sock(sock_cli_sender, HDR_SRV_INCOMING_MESSAGE, USERNAME_SERVER, "user is offline");
+        return NULL;
+    }
+
+    char buffer_head[HEADER_LEN] = HDR_SRV_INCOMING_MESSAGE;
+
+    if (sock_uname.find(sock_cli_sender) != sock_uname.end()) {
+        const char* tmp = (sock_uname[sock_cli_sender]).c_str();
+        bcopy(tmp, uname, OPT_UNAME_LEN);
+    } else {
+        char tmp[] = USERNAME_UNKNOWN;
+        bcopy(tmp, uname, OPT_UNAME_LEN);
+    }
+
+    send_msg_by_sock(sock_cli_recver, buffer_head, uname, buffer_msg);
+
+    return NULL;
+}
+
+
 void* disc_client(void* arg) {
 
     int sockfd = *((int*)arg);
 
+    std::cout << "disconnected: " << sockfd << std::endl;
+
     shutdown(sockfd, SHUT_RDWR);
     close(sockfd);
 
     sockets.accepted.erase(sockfd);
-    ip_sock.erase(ip_sock[sockfd]);
+    uname_sock.erase(sock_uname[sockfd]);
+    sock_uname.erase(sockfd);
 
-    int* rc = new int(2);           // client disconnected return code
+    int* rc = new int(RC_CLIENT_DISCONNECTED);           // client disconnected return code
     return (void*)rc;
 }
 
+
 void* disc_chosen_client(void* arg) {
-    char input_ip[32];
 
-    memset(input_ip, 0, 32);
-    std::cin >> input_ip;
+    char input_name[OPT_UNAME_LEN + OPT_MSGLEN_LEN];
+    memset(input_name, 0, OPT_UNAME_LEN + OPT_MSGLEN_LEN);
+    std::cin.getline(input_name, OPT_UNAME_LEN + OPT_MSGLEN_LEN);
+    std::cin.clear();
 
-    struct hostent *recver;
-    recver = gethostbyname(input_ip);
+    int sockfd = uname_sock[std::string(input_name)];
 
-    if (recver == NULL) {
-        fprintf(stderr, "ERROR, no such host\n");
-        return NULL;
-    }
-
-    int sockfd = ip_sock[*((in_addr_t*)(recver->h_addr))];
+    std::cout << "disconnecting " << input_name << std::endl;
 
     shutdown(sockfd, SHUT_RDWR);
     close(sockfd);
 
     sockets.accepted.erase(sockfd);
-    ip_sock.erase(ip_sock[sockfd]);
+    uname_sock.erase(std::string(input_name));
+    sock_uname.erase(sockfd);
 
     pthread_t* thread = sock_thread[sockfd];
     pthread_detach(*thread);
@@ -126,94 +283,28 @@ void* disc_chosen_client(void* arg) {
     return NULL;
 }
 
+
 void* close_server(void* arg) {
     printf("\nclosing...\n");
-    int* rc = new int(1);
+    int* rc = new int(RC_SERVER_CLOSING);
     return (void*)rc;
 }
 
-void* serv_msg(void* arg) {     // service msg to 1 client
-
-    int rc;
-
-    char header[HEADER_LENGTH] = "inc_msg";
-    char input_ip[32];
-    char input_msg[MSG_LENGTH];
-    memset(input_ip, 0, 32);
-    std::cin >> input_ip;
-    std::cin >> input_msg;
-
-    struct hostent *recver;
-    recver = gethostbyname(input_ip);
-
-    if (recver == NULL) {
-        fprintf(stderr, "ERROR, no such host\n");
-        return NULL;
-    }
-
-    int sockfd = ip_sock[*((in_addr_t*)(recver->h_addr))];
-
-    char* buffer_head = header;
-    char  buffer_opt[OPT_LENGTH];
-    bcopy(&(serv_addr.sin_addr.s_addr), buffer_opt, IP_LENGTH);
-
-    char* buffer_msg = input_msg;
-    rc = write(sockfd, buffer_head, HEADER_LENGTH);
-    rc = write(sockfd, buffer_opt, OPT_LENGTH);
-    rc = write(sockfd, buffer_msg, MSG_LENGTH);
-
-    if (rc < 0) {
-        perror("ERROR writing to socket");
-        exit(1);
-    }
-
-    return NULL;
-}
-
-void* serv_msg_bc(void* arg) {  // service msg to all clients
-
-    char input_msg[MSG_LENGTH];
-    std::cin >> input_msg;
-
-    for (std::map<in_addr_t, int>::iterator it = ip_sock.begin(); it != ip_sock.end(); it++) {
-
-        int sockfd = it->second;
-        int rc;
-
-        char header[HEADER_LENGTH] = "inc_msg";
-
-
-        char* buffer_head = header;
-        char  buffer_opt[OPT_LENGTH];
-        bcopy(&(serv_addr.sin_addr.s_addr), buffer_opt, IP_LENGTH);
-
-        char* buffer_msg = input_msg;
-        rc = write(sockfd, buffer_head, HEADER_LENGTH);
-        rc = write(sockfd, buffer_opt, OPT_LENGTH);
-        rc = write(sockfd, buffer_msg, MSG_LENGTH);
-
-        if (rc < 0) {
-            perror("ERROR writing to socket");
-            exit(1);
-        }
-    }
-
-    return NULL;
-}
 
 void* wait_for_recv(void* arg) {
 
     int newsockfd = *(int*)arg;
 
     ssize_t rc;
-    char buffer[HEADER_LENGTH];
+    char buffer[HEADER_LEN];
 
     while(1) {
 
-        bzero(buffer, HEADER_LENGTH);
-        rc = readn(newsockfd, buffer, HEADER_LENGTH);
+        bzero(buffer, HEADER_LEN);
+        rc = readn(newsockfd, buffer, HEADER_LEN);
 
-        if (rc < 0) {
+        if (rc <= 0) {
+            std::cout << "client lost connection/n" << std::endl;
             void* rc_disc = disc_client((void*)&newsockfd); // connection lost
             free(rc_disc);
             return NULL;
@@ -224,7 +315,7 @@ void* wait_for_recv(void* arg) {
             void* rc_handlers_recv = handlers[header]((void*)&newsockfd);
 
             if (rc_handlers_recv != NULL) {
-                if (*((int*)rc_handlers_recv) == 2) {    // checking client disconnected condition
+                if (*((int*)rc_handlers_recv) == RC_CLIENT_DISCONNECTED) {    // checking client disconnected condition
                     free(rc_handlers_recv);
                     return NULL;
                 }
@@ -235,10 +326,12 @@ void* wait_for_recv(void* arg) {
     return NULL;
 }
 
+
 void* monitor (void* arg) {
 
-    handlers.insert(std::pair<std::string, void*(*)(void*)>(std::string("ret_msg"), &ret_msg));         // request for msg retransmission
-    handlers.insert(std::pair<std::string, void*(*)(void*)>(std::string("disc_me"), &disc_client));     // request for client disconnecting
+    handlers.insert(fname_function(std::string(HDR_CLI_AUTHORIZE), &auth_client));         // request for authorization
+    handlers.insert(fname_function(std::string(HDR_CLI_RETRANSMIT_MESSAGE), &ret_msg));    // request for msg retransmission
+    handlers.insert(fname_function(std::string(HDR_CLI_DISCONNECT), &disc_client));        // request for client disconnecting
 
     pthread_t* thread_recv = new pthread_t;
 
@@ -257,7 +350,6 @@ void* monitor (void* arg) {
             exit(1);
         }
 
-        ip_sock.insert(std::pair<in_addr_t, int>(cli_addr.sin_addr.s_addr, newsockfd));   // write to ip-socket map
         sockets.accepted.insert(newsockfd); // add to opened sockets list
 
         pthread_create(thread_recv, NULL, &wait_for_recv, (void*)&newsockfd);
@@ -265,24 +357,26 @@ void* monitor (void* arg) {
     }
 }
 
+
 void* listen_cmd(void* arg) {
 
     std::map<std::string, void*(*)(void*)> handlers_cmd;
 
-    handlers_cmd.insert(std::pair<std::string, void*(*)(void*)>(std::string("exit"), &close_server));
-    handlers_cmd.insert(std::pair<std::string, void*(*)(void*)>(std::string("serv_msg"), &serv_msg));
-    handlers_cmd.insert(std::pair<std::string, void*(*)(void*)>(std::string("serv_msg_bc"), &serv_msg_bc));
-    handlers_cmd.insert(std::pair<std::string, void*(*)(void*)>(std::string("disc"), &disc_chosen_client));
+    handlers_cmd.insert(fname_function(std::string(CMD_EXIT), &close_server));
+    handlers_cmd.insert(fname_function(std::string(CMD_SEND_MESSAGE), &send_msg));
+    handlers_cmd.insert(fname_function(std::string(CMD_BROADCAST_MESSAGE), &send_msg_bc));
+    handlers_cmd.insert(fname_function(std::string(CMD_DISCONNECT_CLIENT), &disc_chosen_client));
 
     while(1) {
         std::string input;
         std::cin >> input;
+        std::cin.get();
 
         if (handlers_cmd.find(input) != handlers_cmd.end()) {
             void* rc_handlers_cmd = handlers_cmd[input](NULL);
 
             if (rc_handlers_cmd != NULL) {
-                if (*((int*)rc_handlers_cmd) == 1) {    // checking exit condition
+                if (*((int*)rc_handlers_cmd) == RC_SERVER_CLOSING) {    // checking exit condition
                     return NULL;
                 }
             }
@@ -291,13 +385,13 @@ void* listen_cmd(void* arg) {
     }
 }
 
+
 int main(int argc, char *argv[]) {
 
     int sockfd;
     uint16_t portno;
     ssize_t n;
 
-    /* First call to socket() function */
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (sockfd < 0) {
@@ -305,7 +399,6 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    /* Initialize socket structure */
     bzero((char *) &serv_addr, sizeof(serv_addr));
     portno = 5001;
 
@@ -327,9 +420,10 @@ int main(int argc, char *argv[]) {
     pthread_create(&thread_monitor, NULL, &monitor, NULL);
     pthread_create(&thread_listen_cmd, NULL, &listen_cmd, NULL);
 
+    printf("\nserver running\n");
     printf("\nType 'exit' to end the program\n\n");
     pthread_join(thread_listen_cmd, NULL);
-    pthread_detach(thread_monitor);
+    pthread_cancel(thread_monitor);
 
     std::set<int>::iterator it;
     for (it = sockets.accepted.begin(); it != sockets.accepted.end(); it++) {
@@ -337,7 +431,6 @@ int main(int argc, char *argv[]) {
         close(*it);
     }
 
-    /* Closing socket */
     shutdown(sockfd, SHUT_RDWR);
     close(sockfd);
 
