@@ -21,12 +21,17 @@
 
 #define CMD_AUTHORIZE_ME    "auth"
 #define CMD_SEND_MESSAGE    "msg"
+#define CMD_BC_MESSAGE      "bcmsg"
 #define CMD_DISCONNECT_ME   "disc"
 #define CMD_EXIT            "exit"
 
 #define HDR_CLI_AUTHORIZE           "auth_me"
 #define HDR_CLI_RETRANSMIT_MESSAGE  "ret_msg"
+#define HDR_CLI_BROADCAST_MESSAGE   "ret_bcm"
 #define HDR_CLI_DISCONNECT          "disc_me"
+
+#define HDR_SRV_INCOMING_MESSAGE    "inc_msg"
+#define HDR_SRV_ERROR               "err_msg"
 
 #define RC_CLIENT_CLOSING   1
 
@@ -38,6 +43,9 @@ std::map<std::string, void*(*)(void*)> handlers;  // key: msg header; value: han
 
 DWORD thread_wait_for_recv;
 DWORD thread_listen_cmd;
+
+HANDLE h_wait_for_recv;
+HANDLE h_listen_cmd;
 
 int readn(int s, char* buf, int b_remain) {
     int b_rcvd = 0;
@@ -61,59 +69,62 @@ void send_msg_by_sock(int socket, char* header, char* uname, char* msg) {
     char buffer_msg[MSG_MAXLEN];
 
     memset(buffer_head, 0, HEADER_LEN);
-    memset(buffer_opt,  0, OPT_UNAME_LEN + OPT_MSGLEN_LEN);
+    memset(buffer_opt, 0, OPT_UNAME_LEN + OPT_MSGLEN_LEN);
     memset(buffer_msg, 0, MSG_MAXLEN);
 
     memcpy(buffer_head, header, HEADER_LEN);
 
+
     short int msg_len = 0;
     int opt_len = 0;
 
-    if (uname != NULL) {
-        opt_len += OPT_UNAME_LEN;
-    }
-    if (msg != NULL) {
-        msg_len = strlen(msg);
-        opt_len += OPT_MSGLEN_LEN;
-    }
+    opt_len += (uname == NULL) ? 0 : OPT_UNAME_LEN;
+    opt_len += (msg == NULL) ? 0 : OPT_MSGLEN_LEN;
+    msg_len += (msg == NULL) ? 0 : strlen(msg);
 
     if (uname != NULL) {
         memcpy(buffer_opt, uname, OPT_UNAME_LEN);
     }
 
     if (msg_len != 0) {
-        memcpy(buffer_opt + OPT_UNAME_LEN, &msg_len, OPT_MSGLEN_LEN);
+        if (uname != NULL) {
+            memcpy(buffer_opt + OPT_UNAME_LEN, &msg_len, OPT_MSGLEN_LEN);
+        } else {
+            memcpy(buffer_opt, &msg_len, OPT_MSGLEN_LEN);
+        }
         memcpy(buffer_msg, msg, msg_len);
     }
 
     send(socket, buffer_head, HEADER_LEN, 0);
-    if (opt_len != 0) {
-        send(socket, buffer_opt, opt_len, 0);
-    }
+    send(socket, buffer_opt, opt_len, 0);
     if (msg_len != 0) {
         send(socket, buffer_msg, msg_len, 0);
     }
 }
 
 
-void recv_msg_by_sock(int socket, char* buffer_opt, char* buffer_msg) {
+void recv_msg_by_sock(int socket, char* uname, char* buffer_msg) {
 
+    char buffer_opt[OPT_UNAME_LEN + OPT_MSGLEN_LEN];
     memset(buffer_opt, 0, OPT_UNAME_LEN + OPT_MSGLEN_LEN);
     if (buffer_msg != NULL) {
         memset(buffer_msg, 0, MSG_MAXLEN);
     }
 
-    int opt_len;
-    if (buffer_msg != NULL) {
-        opt_len = OPT_UNAME_LEN + OPT_MSGLEN_LEN;
-    } else {
-        opt_len = OPT_UNAME_LEN;
-    }
+    int opt_len = 0;
+    short int msg_len = 0;
+
+    opt_len += (uname == NULL) ? 0 : OPT_UNAME_LEN;
+    opt_len += (buffer_msg == NULL) ? 0 : OPT_MSGLEN_LEN;
+    msg_len += (buffer_msg == NULL) ? 0 : MSG_MAXLEN;
 
     readn(socket, buffer_opt, opt_len);
-
-    short int msg_len;
-    memcpy(&msg_len, buffer_opt + OPT_UNAME_LEN, OPT_MSGLEN_LEN);
+    if (uname != NULL) {
+        memcpy(uname, buffer_opt, OPT_UNAME_LEN);
+        memcpy(&msg_len, buffer_opt + OPT_UNAME_LEN, OPT_MSGLEN_LEN);
+    } else {
+        memcpy(&msg_len, buffer_opt, OPT_MSGLEN_LEN);
+    }
 
     if (msg_len != 0) {
         readn(socket, buffer_msg, msg_len);
@@ -125,14 +136,23 @@ void* inc_msg(void* arg) {
     int sock_serv = *((int*)arg);
     char buffer_opt[OPT_UNAME_LEN + OPT_MSGLEN_LEN];
     char buffer_msg[MSG_MAXLEN];
-
-    recv_msg_by_sock(sock_serv, buffer_opt, buffer_msg);
-
     char uname[OPT_UNAME_LEN];
-    memset(uname, 0, OPT_UNAME_LEN);
-    memcpy(uname, buffer_opt, OPT_UNAME_LEN); // get username from [options]
+
+    recv_msg_by_sock(sock_serv, uname, buffer_msg);
+
 
     printf("%s > [ %s ]\n\n", uname, buffer_msg);
+
+    return NULL;
+}
+
+void* err_msg(void* arg) {
+    int sock_serv = *((int*)arg);
+    char buffer_msg[MSG_MAXLEN];
+
+    recv_msg_by_sock(sock_serv, NULL, buffer_msg);
+
+    printf("ERROR: [ %s ]\n\n", buffer_msg);
 
     return NULL;
 }
@@ -156,9 +176,10 @@ void* disc_me(void* arg) {
     int rc;
     char header[HEADER_LEN] = HDR_CLI_DISCONNECT;
 
+    TerminateThread(h_wait_for_recv, NULL);
+    WaitForSingleObject (h_wait_for_recv, INFINITE);
     send_msg_by_sock(sockfd, header, NULL, NULL);
 
-    ExitThread(thread_wait_for_recv);
     shutdown(sockfd, SD_BOTH);
     closesocket(sockfd);
 
@@ -189,6 +210,18 @@ void* send_msg(void* arg) {
     return NULL;
 }
 
+void* bc_msg(void* arg) {
+    char buffer_head[HEADER_LEN] = HDR_CLI_BROADCAST_MESSAGE;
+    char input_msg[MSG_MAXLEN];
+    memset(input_msg, 0, MSG_MAXLEN);
+    std::cin.getline(input_msg, MSG_MAXLEN);
+    std::cin.clear();
+
+    send_msg_by_sock(sockfd, buffer_head, NULL, input_msg);
+
+    return NULL;
+}
+
 DWORD WINAPI wait_for_recv(CONST LPVOID arg) {
 
     int newsockfd = *(int*)arg;
@@ -206,9 +239,12 @@ DWORD WINAPI wait_for_recv(CONST LPVOID arg) {
             closesocket(sockfd);
             std::cout << "connection lost\n";
 
-            /* TBD */
+            TerminateThread(h_listen_cmd, NULL);
+            CloseHandle(overlapped.hEvent);
+            CloseHandle(h_listen_cmd);
+            WaitForSingleObject (h_listen_cmd, INFINITE);
 
-            exit(1);
+            ExitThread(NULL);
         }
 
         std::string header(buffer);
@@ -228,6 +264,7 @@ DWORD WINAPI listen_cmd(CONST LPVOID arg) {
     handlers_cmd.insert(fname_function(std::string(CMD_DISCONNECT_ME), &disc_me));
     handlers_cmd.insert(fname_function(std::string(CMD_AUTHORIZE_ME), &auth_me));
     handlers_cmd.insert(fname_function(std::string(CMD_SEND_MESSAGE), &send_msg));
+    handlers_cmd.insert(fname_function(std::string(CMD_BC_MESSAGE), &bc_msg));
 
     while(1) {
 
@@ -258,7 +295,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    handlers.insert(fname_function(std::string("inc_msg"), &inc_msg)); // incoming message
+    handlers.insert(fname_function(std::string(HDR_SRV_INCOMING_MESSAGE), &inc_msg)); // incoming message
+    handlers.insert(fname_function(std::string(HDR_SRV_ERROR), &err_msg));            // error message
 
     uint16_t portno;
     struct sockaddr_in serv_addr;
@@ -295,14 +333,15 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    HANDLE h_wait_for_recv = CreateThread(
+    h_wait_for_recv = CreateThread(
             NULL, NULL, &wait_for_recv, (void*)(&sockfd), NULL, &thread_wait_for_recv);
-    HANDLE h_listen_cmd = CreateThread(
+    h_listen_cmd = CreateThread(
             NULL, NULL, &listen_cmd, (void*)(&sockfd), NULL, &thread_listen_cmd);
 
     printf("\nType 'exit' to end the program\n\n");
-    WaitForSingleObject (h_wait_for_recv, NULL);
-    ExitThread(thread_wait_for_recv);
+    WaitForSingleObject (h_listen_cmd, INFINITE);
+    TerminateThread(h_wait_for_recv, NULL);
+    WaitForSingleObject (h_wait_for_recv, INFINITE);
 
     shutdown(sockfd, SD_BOTH);
     closesocket(sockfd);
